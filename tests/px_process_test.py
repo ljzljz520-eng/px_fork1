@@ -2,6 +2,8 @@ import getpass
 import datetime
 
 import os
+import sys
+import errno
 import pytest
 
 from px import px_process
@@ -388,3 +390,183 @@ def test_resolve_links_multiple_roots():
             root = root.parent
 
         assert root is root0
+
+
+def _unused_pid():
+    # type: () -> int
+    """A PID that currently refers to no process."""
+    for pid in range(400000, 410000):
+        try:
+            os.kill(pid, 0)
+        except OSError as e:
+            if e.errno == errno.ESRCH:
+                return pid
+    pytest.skip("Could not find an unused PID")
+    return -1  # pragma: no cover
+
+
+def test_get_process():
+    process = px_process.get_process(os.getpid())
+    assert process is not None
+    assert process.pid == os.getpid()
+
+    assert px_process.get_process(_unused_pid()) is None
+
+
+def test_read_start_tick():
+    tick = px_process.read_start_tick(os.getpid())
+    if sys.platform.startswith("linux") or sys.platform == "darwin":
+        # The platform tick must exist, be positive and immutable for the
+        # lifetime of this process instance.
+        assert tick is not None
+        platform_name, value = tick
+        assert platform_name in ("linux", "darwin")
+        assert value > 0
+        assert tick == px_process.read_start_tick(os.getpid())
+    else:
+        assert tick is None
+
+    # Gone PIDs never get a tick
+    assert px_process.read_start_tick(_unused_pid()) is None
+
+
+def test_start_fingerprint_timestamp_fallback():
+    timestamp = testutils.TIME
+    other = testutils.TIME + datetime.timedelta(seconds=5)
+
+    # No ticks on either side: ps timestamp is the compatibility fallback
+    assert px_process.StartFingerprint(timestamp, None).matches(
+        px_process.StartFingerprint(timestamp, None)
+    )
+    assert not px_process.StartFingerprint(timestamp, None).matches(
+        px_process.StartFingerprint(other, None)
+    )
+
+
+def test_start_fingerprint_tick_must_match():
+    timestamp = testutils.TIME
+
+    # Equal ticks and timestamps: same instance
+    assert px_process.StartFingerprint(timestamp, ("linux", 42)).matches(
+        px_process.StartFingerprint(timestamp, ("linux", 42))
+    )
+
+    # Same one-second ps timestamp but different start tick means the PID was
+    # reused inside the timestamp resolution window: not the same instance
+    assert not px_process.StartFingerprint(timestamp, ("linux", 42)).matches(
+        px_process.StartFingerprint(timestamp, ("linux", 99))
+    )
+
+    # Different timestamps never match, regardless of ticks
+    other = timestamp + datetime.timedelta(seconds=1)
+    assert not px_process.StartFingerprint(timestamp, ("linux", 42)).matches(
+        px_process.StartFingerprint(other, ("linux", 42))
+    )
+
+    # Ticks from different platforms never match
+    assert not px_process.StartFingerprint(timestamp, ("linux", 42)).matches(
+        px_process.StartFingerprint(timestamp, ("darwin", 42))
+    )
+
+    # Exactly one readable tick fails closed: we must not mistake an
+    # unverifiable replacement for the original instance
+    assert not px_process.StartFingerprint(timestamp, ("linux", 42)).matches(
+        px_process.StartFingerprint(timestamp, None)
+    )
+    assert not px_process.StartFingerprint(timestamp, None).matches(
+        px_process.StartFingerprint(timestamp, ("linux", 42))
+    )
+
+
+REUSE_PID = 47536
+OLD_TIMESTRING = testutils.TIMESTRING
+NEW_TIMESTRING = "Mon May  7 09:33:11 2010"
+
+
+def test_process_identity_resolve_matched(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    original = testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)
+    identity = px_process.ProcessIdentity.capture(original)
+
+    monkeypatch.setattr(px_process, "get_process", lambda pid: original)
+    resolution = identity.resolve()
+    assert resolution.is_match
+    assert resolution.state == px_process.IdentityResolution.MATCHED
+    assert resolution.process is original
+
+    # An equivalent snapshot record also proves identity
+    snapshot = [testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)]
+    assert identity.resolve(snapshot).is_match
+
+
+def test_process_identity_resolve_gone(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    original = testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)
+    identity = px_process.ProcessIdentity.capture(original)
+
+    monkeypatch.setattr(px_process, "get_process", lambda pid: None)
+    resolution = identity.resolve()
+    assert resolution.is_stale
+    assert resolution.stale_reason == px_process.IdentityResolution.GONE
+    assert resolution.process is None
+
+    # And via an empty snapshot
+    assert identity.resolve([]).stale_reason == px_process.IdentityResolution.GONE
+
+
+def test_process_identity_resolve_replaced(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    original = testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)
+    identity = px_process.ProcessIdentity.capture(original)
+
+    # Same PID number, different ps start timestamp: PID got reused
+    replacement = testutils.create_process(pid=REUSE_PID, timestring=NEW_TIMESTRING)
+    monkeypatch.setattr(px_process, "get_process", lambda pid: replacement)
+
+    resolution = identity.resolve()
+    assert resolution.is_stale
+    assert resolution.stale_reason == px_process.IdentityResolution.REPLACED
+    assert resolution.process is replacement
+
+
+def test_process_identity_resolve_same_second_reuse(monkeypatch):
+    """
+    The simulated replacement has the same PID and even the same one-second ps
+    timestamp, but a different platform start tick. It must be reported as
+    replaced, never matched.
+    """
+    ticks = {REUSE_PID: 100}
+    monkeypatch.setattr(
+        px_process,
+        "read_start_tick",
+        lambda pid: ("linux", ticks[pid]) if pid in ticks else None,
+    )
+
+    original = testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)
+    identity = px_process.ProcessIdentity.capture(original)
+    assert identity.fingerprint.tick == ("linux", 100)
+
+    # Replacement process with an identical ps timestamp, different tick
+    replacement = testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)
+    ticks[REUSE_PID] = 101
+    monkeypatch.setattr(px_process, "get_process", lambda pid: replacement)
+
+    resolution = identity.resolve()
+    assert resolution.stale_reason == px_process.IdentityResolution.REPLACED
+    assert resolution.process is replacement
+
+
+def test_process_identity_matches_process(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    original = testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)
+    identity = px_process.ProcessIdentity.capture(original)
+
+    assert identity.matches_process(
+        testutils.create_process(pid=REUSE_PID, timestring=OLD_TIMESTRING)
+    )
+    assert not identity.matches_process(
+        testutils.create_process(pid=REUSE_PID, timestring=NEW_TIMESTRING)
+    )
+    assert not identity.matches_process(
+        testutils.create_process(pid=REUSE_PID + 1, timestring=OLD_TIMESTRING)
+    )

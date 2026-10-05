@@ -92,6 +92,12 @@ class PxProcessMenu:
 
     def __init__(self, process: px_process.PxProcess) -> None:
         self.process = process
+
+        # Immutable (PID, start fingerprint) of the selected instance. Every
+        # action re-resolves this instead of trusting the PID, so a PID that
+        # exited or got reused can never be inspected or signalled.
+        self.identity = px_process.ProcessIdentity.capture(process)
+
         self.done = False
 
         # Shown to user, status of last operation
@@ -99,6 +105,19 @@ class PxProcessMenu:
 
         # Index into MENU_ENTRIES
         self.active_entry = 0
+
+    def stale_status(self, state: str) -> str:
+        pid = self.identity.pid
+        command = self.process.command
+        if state == px_process.IdentityResolution.GONE:
+            return f"Process {pid} <{command}> no longer exists, nothing to do"
+        if state == px_process.IdentityResolution.REPLACED:
+            return (
+                f"PID {pid} is now held by a different process instance, "
+                f"leaving it untouched"
+            )
+
+        raise ValueError(f"Not a stale state: {state!r}")
 
     def refresh_display(self) -> None:
         _, columns = px_terminal.get_window_size()
@@ -173,7 +192,16 @@ class PxProcessMenu:
         """
         Process menu main loop
         """
-        while (not self.done) and (self.process.is_alive()):
+        while not self.done:
+            # Re-prove identity on every iteration; the menu must close
+            # itself rather than act on an exited or reused PID.
+            resolution = self.identity.resolve()
+            if resolution.is_stale:
+                self.status = self.stale_status(resolution.state)
+                self.refresh_display()
+                self.done = True
+                return
+
             self.refresh_display()
             self.await_and_handle_user_input()
 
@@ -181,36 +209,48 @@ class PxProcessMenu:
         """
         Display process info in a pager.
         """
+        resolution = self.identity.resolve()
+        if resolution.is_stale:
+            self.status = self.stale_status(resolution.state)
+            return
+
         processes = px_process.get_all()
-        process = px_processinfo.find_process_by_pid(self.process.pid, processes)
-        if not process:
-            # Process not available, never mind
+        process = px_processinfo.find_process_by_pid(self.identity.pid, processes)
+        if process is None:
+            self.status = self.stale_status(px_process.IdentityResolution.GONE)
+            return
+        if not self.identity.matches_process(process):
+            # The record at our PID got replaced between the two reads
+            self.status = self.stale_status(px_process.IdentityResolution.REPLACED)
             return
 
         with px_terminal.normal_display():
             px_pager.page_process_info(process, processes)
 
-    def await_death(self, message):
-        # type(str) -> None
+    def await_death(self, message: str) -> str:
         """
-        Wait KILL_TIMEOUT_SECONDS for process to die.
+        Wait KILL_TIMEOUT_SECONDS for the selected process instance to die.
 
-        Returns after either the process dies or we run out of time,
-        whichever comes first.
+        Returns an IdentityResolution state: GONE if the instance went away,
+        REPLACED if a different instance took over the PID while waiting (in
+        which case the caller must not escalate), or MATCHED on timeout.
         """
         t0 = time.time()
         while (time.time() - t0) < KILL_TIMEOUT_SECONDS:
-            if not self.process.is_alive():
-                return
+            resolution = self.identity.resolve()
+            if resolution.state != px_process.IdentityResolution.MATCHED:
+                return resolution.state
 
             dt_s = time.time() - t0
             countdown_s = KILL_TIMEOUT_SECONDS - dt_s
             if countdown_s <= 0:
-                return
+                return px_process.IdentityResolution.MATCHED
             self.status = f"{countdown_s:.1f}s {message}"
             self.refresh_display()
 
             time.sleep(0.1)
+
+        return px_process.IdentityResolution.MATCHED
 
     def kill_process(
         self, signal_process: Callable[[px_process.PxProcess, int], bool]
@@ -218,8 +258,16 @@ class PxProcessMenu:
         """
         Send first SIGTERM then SIGKILL to a process.
 
-        Wait KILL_TIMEOUT_SECONDS secods in between to give it a chance to go away.
+        Wait KILL_TIMEOUT_SECONDS secods in between to give it a chance to go
+        away. Identity is re-proved before each signal and before each
+        liveness check, so a reused PID is never signalled and SIGKILL is
+        blocked if the process got replaced after SIGTERM.
         """
+        # Prove the selected instance still exists before doing anything
+        resolution = self.identity.resolve()
+        if resolution.is_stale:
+            self.status = self.stale_status(resolution.state)
+            return
 
         # Please go away
         if not signal_process(self.process, SIGTERM):
@@ -227,18 +275,36 @@ class PxProcessMenu:
                 "Not allowed to kill <" + self.process.command + ">, try again as root!"
             )
             return
-        self.await_death(
+
+        death_state = self.await_death(
             f"Waiting for {self.process.command} to shut down after SIGTERM"
         )
-        if not self.process.is_alive():
+        if death_state == px_process.IdentityResolution.GONE:
             return
+        if death_state == px_process.IdentityResolution.REPLACED:
+            # Some other process now holds the PID, never escalate at it
+            self.status = self.stale_status(death_state)
+            return
+
+        # The instance is still there, re-prove identity before escalating
+        resolution = self.identity.resolve()
+        if resolution.state == px_process.IdentityResolution.GONE:
+            return
+        if resolution.state == px_process.IdentityResolution.REPLACED:
+            self.status = self.stale_status(resolution.state)
+            return
+        assert resolution.state == px_process.IdentityResolution.MATCHED
 
         # Die!!
         assert signal_process(self.process, SIGKILL)
-        self.await_death(
+        death_state = self.await_death(
             f"Waiting for {self.process.command} to shut down after kill -9"
         )
-        if not self.process.is_alive():
+        if death_state == px_process.IdentityResolution.GONE:
+            return
+        if death_state == px_process.IdentityResolution.REPLACED:
+            # The replacement that took over the PID got spared
+            self.status = self.stale_status(death_state)
             return
 
         self.status = "<" + self.process.command + "> did not die!"

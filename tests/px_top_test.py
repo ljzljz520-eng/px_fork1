@@ -5,6 +5,7 @@ from px import px_poller
 from px import px_process
 from px import px_terminal
 from px import px_launchcounter
+from px import px_process_menu
 
 from . import testutils
 
@@ -157,3 +158,140 @@ def test_get_screen_lines_returns_enough_lines():
     lines = px_top.get_screen_lines(baseline, poller, SCREEN_ROWS, 99)
 
     assert len(lines) == SCREEN_ROWS
+
+
+SELECTED_PID = 424242
+OLD_TIMESTRING = "Mon Mar  7 09:33:11 2016"
+OTHER_TIMESTRING = "Mon May  7 09:33:11 2010"
+
+
+def _reset_highlight(identity=None, row=0):
+    px_top.last_highlighted_identity = identity
+    px_top.last_highlighted_row = row
+    px_top.highlight_has_moved = True
+
+
+def test_highlight_follows_same_instance_across_refresh(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    selected = testutils.create_process(
+        pid=SELECTED_PID, timestring=OLD_TIMESTRING, commandline="/bin/selected"
+    )
+    other = testutils.create_process(
+        pid=SELECTED_PID + 1, timestring=OTHER_TIMESTRING, commandline="/bin/other"
+    )
+    identity = px_process.ProcessIdentity.capture(selected)
+    _reset_highlight(identity, row=0)
+
+    # Selected instance moved to row 1 in this refresh
+    assert px_top.get_line_to_highlight([other, selected], 50) == 1
+    assert px_top.last_highlighted_identity == identity
+
+    # ... and back to row 0 in the next one
+    assert px_top.get_line_to_highlight([selected, other], 50) == 0
+    assert px_top.last_highlighted_identity == identity
+
+    # An equivalent (re-parsed) record is still the same instance
+    selected_again = testutils.create_process(
+        pid=SELECTED_PID, timestring=OLD_TIMESTRING, commandline="/bin/selected"
+    )
+    assert px_top.get_line_to_highlight([selected_again], 50) == 0
+    assert px_top.last_highlighted_identity == identity
+
+
+def test_highlight_cleared_when_instance_disappears(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    selected = testutils.create_process(
+        pid=SELECTED_PID, timestring=OLD_TIMESTRING, commandline="/bin/selected"
+    )
+    other = testutils.create_process(
+        pid=SELECTED_PID + 1, timestring=OTHER_TIMESTRING, commandline="/bin/other"
+    )
+    identity = px_process.ProcessIdentity.capture(selected)
+    _reset_highlight(identity, row=0)
+
+    # The selected instance is gone from this refresh
+    assert px_top.get_line_to_highlight([other], 50) == 0
+    assert px_top.last_highlighted_identity != identity
+    assert px_top.last_highlighted_identity is not None
+    assert px_top.last_highlighted_identity.matches_process(other)
+
+
+def test_highlight_not_fooled_by_pid_reuse(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    selected = testutils.create_process(
+        pid=SELECTED_PID, timestring=OLD_TIMESTRING, commandline="/bin/selected"
+    )
+    reused_pid = testutils.create_process(
+        pid=SELECTED_PID, timestring=OTHER_TIMESTRING, commandline="/bin/replacement"
+    )
+    other = testutils.create_process(
+        pid=SELECTED_PID + 1, timestring=OTHER_TIMESTRING, commandline="/bin/other"
+    )
+    identity = px_process.ProcessIdentity.capture(selected)
+    _reset_highlight(identity, row=0)
+
+    # Same PID number, different start fingerprint: the highlight must not
+    # follow the replacement
+    assert px_top.get_line_to_highlight([other, reused_pid], 50) == 0
+    assert px_top.last_highlighted_identity is not None
+    assert not px_top.last_highlighted_identity.matches_process(reused_pid)
+    assert px_top.last_highlighted_identity.matches_process(other)
+
+
+def test_highlight_not_fooled_by_same_second_reuse(monkeypatch):
+    """Replacement within the one-second ps resolution, different tick."""
+    ticks = {SELECTED_PID: 100}
+    monkeypatch.setattr(
+        px_process,
+        "read_start_tick",
+        lambda pid: ("linux", ticks[pid]) if pid in ticks else None,
+    )
+
+    selected = testutils.create_process(
+        pid=SELECTED_PID, timestring=OLD_TIMESTRING, commandline="/bin/selected"
+    )
+    identity = px_process.ProcessIdentity.capture(selected)
+    assert identity.fingerprint.tick == ("linux", 100)
+
+    reused_pid = testutils.create_process(
+        pid=SELECTED_PID, timestring=OLD_TIMESTRING, commandline="/bin/replacement"
+    )
+    ticks[SELECTED_PID] = 101
+    _reset_highlight(identity, row=0)
+
+    assert px_top.get_line_to_highlight([reused_pid], 50) == 0
+    assert px_top.last_highlighted_identity != identity
+    assert not identity.matches_process(reused_pid)
+
+
+def test_get_command_stale_identity_opens_no_menu(monkeypatch):
+    monkeypatch.setattr(px_process, "read_start_tick", lambda pid: None)
+    selected = testutils.create_process(pid=SELECTED_PID, timestring=OLD_TIMESTRING)
+    identity = px_process.ProcessIdentity.capture(selected)
+    _reset_highlight(identity, row=0)
+    px_top.top_mode = px_top.MODE_BASE
+
+    # The selected instance disappears before ENTER is handled
+    monkeypatch.setattr(px_process, "get_process", lambda pid: None)
+
+    opened = []
+
+    class FakeMenu:
+        def __init__(self, process):
+            opened.append(process)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(px_process_menu, "PxProcessMenu", FakeMenu)
+
+    pipe = os.pipe()
+    read, write = pipe
+    os.write(write, px_terminal.KEY_ENTER.encode() + b"q")
+
+    assert px_top.get_command(timeout_seconds=0, fd=read) == px_top.CMD_QUIT
+
+    # No menu was opened for whoever (or whatever) is at the PID now...
+    assert opened == []
+    # ... and the stale selection was cleared
+    assert px_top.last_highlighted_identity is None

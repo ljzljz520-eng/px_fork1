@@ -4,7 +4,10 @@ import operator
 
 import os
 import re
+import sys
 import pwd
+import ctypes
+import ctypes.util
 import errno
 import subprocess
 
@@ -13,6 +16,8 @@ from . import px_exec_util
 
 
 from typing import Dict
+from typing import Tuple
+from typing import ClassVar
 from typing import Optional
 from typing import List
 from typing import Iterable
@@ -34,6 +39,11 @@ CPUTIME_LINUX = re.compile("^([0-9][0-9]):([0-9][0-9]):([0-9][0-9])$")
 
 # Match + group: "123-01:23:45"
 CPUTIME_LINUX_DAYS = re.compile("^([0-9]+)-([0-9][0-9]):([0-9][0-9]):([0-9][0-9])$")
+
+
+# Fields we ask ps to print, both when listing all processes and when
+# re-reading just one process. Keep this in sync with PS_LINE above.
+PS_OUTPUT_FIELDS = "pid=,ppid=,rss=,lstart=,uid=,pcpu=,time=,%mem=,command="
 
 
 TIMEZONE = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
@@ -274,6 +284,315 @@ class PxProcessBuilder:
         )
 
 
+# --- Platform specific process start ticks ---------------------------------
+#
+# A PID alone does not identify a process instance, PIDs get reused. These
+# ticks give us an immutable per-instance start marker with better precision
+# than the one-second resolution ps timestamps provide. The ps "lstart"
+# timestamp is still always captured as a fallback for platforms where these
+# reads are unavailable.
+
+# proc_info.h: #define PROC_PIDTBSDINFO 3
+_PROC_PIDTBSDINFO = 3
+
+_libproc: Optional[ctypes.CDLL] = None
+
+
+class _DarwinBsdInfo(ctypes.Structure):
+    """struct proc_bsdinfo from <sys/proc_info.h>"""
+
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+        # The pbi_reserved[4] tail in the SDK header is not filled in by
+        # proc_pidinfo() and is intentionally left out.
+    ]
+
+
+def _get_libproc() -> Optional[ctypes.CDLL]:
+    global _libproc
+    if _libproc is not None:
+        return _libproc
+
+    library_name = ctypes.util.find_library("proc")
+    if library_name is None:
+        return None
+
+    try:
+        libproc = ctypes.CDLL(library_name)
+    except OSError:
+        return None
+
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+
+    _libproc = libproc
+    return _libproc
+
+
+def _read_darwin_start_tick(pid: int) -> Optional[int]:
+    """Process start time in microseconds since the epoch, via libproc."""
+    libproc = _get_libproc()
+    if libproc is None:
+        return None
+
+    info = _DarwinBsdInfo()
+    result = libproc.proc_pidinfo(
+        pid,
+        _PROC_PIDTBSDINFO,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if result != ctypes.sizeof(info):
+        # PID gone (ESRCH), not permitted (EPERM), or flavor unsupported
+        return None
+
+    return int(info.pbi_start_tvsec) * 1_000_000 + int(info.pbi_start_tvusec)
+
+
+def _read_linux_start_tick(pid: int) -> Optional[int]:
+    """
+    Field 22 (starttime) of /proc/<pid>/stat, in clock ticks since boot.
+    """
+    with open(f"/proc/{pid}/stat", "rb") as stat_file:
+        stat_line = stat_file.read().decode("utf-8", "replace")
+
+    # Field 2 (the comm name) is wrapped in parens and may itself contain
+    # spaces and parens, split at the last one.
+    closing_paren = stat_line.rfind(")")
+    if closing_paren < 0:
+        return None
+
+    fields = stat_line[closing_paren + 1 :].split()
+    # fields[0] is ps field 3 (state), so ps field 22 is index 22 - 3 = 19
+    return int(fields[19])
+
+
+def read_start_tick(pid: int) -> Optional[Tuple[str, int]]:
+    """
+    Read this platform's immutable process start tick, as a
+    (platform-name, tick) tuple.
+
+    Returns None if the tick can't be read, either because the platform does
+    not provide one or because the process is gone / not readable. Callers
+    must then fall back to the ps start timestamp.
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            platform_name = "linux"
+            tick = _read_linux_start_tick(pid)
+        elif sys.platform == "darwin":
+            platform_name = "darwin"
+            tick = _read_darwin_start_tick(pid)
+        else:
+            return None
+    except (OSError, ValueError):
+        return None
+
+    if tick is None:
+        return None
+    return (platform_name, tick)
+
+
+class StartFingerprint:
+    """
+    An immutable marker of when a process instance started.
+
+    The platform tick identifies the instance even if its PID got reused
+    within the one-second resolution of the ps timestamp. The ps timestamp is
+    always kept as a fallback for when no tick can be read.
+    """
+
+    def __init__(
+        self, timestamp: datetime.datetime, tick: Optional[Tuple[str, int]]
+    ) -> None:
+        self.__timestamp = timestamp
+        self.__tick = tick
+
+    @property
+    def timestamp(self) -> datetime.datetime:
+        return self.__timestamp
+
+    @property
+    def tick(self) -> Optional[Tuple[str, int]]:
+        return self.__tick
+
+    @classmethod
+    def capture(cls, pid: int, timestamp: datetime.datetime) -> "StartFingerprint":
+        return cls(timestamp, read_start_tick(pid))
+
+    def matches(self, other: "StartFingerprint") -> bool:
+        """
+        True if both fingerprints can be proven to describe the same process
+        instance.
+
+        Timestamps must always agree. Ticks must also agree when both sides
+        have one. If neither side has a tick we degrade to comparing only the
+        ps timestamp (platform compatibility fallback). If exactly one side
+        has a tick the instance can't be proven identical, so this fails
+        closed: an unrelated replacement must never be mistaken for the old
+        instance.
+        """
+        if self.__timestamp != other.__timestamp:
+            return False
+
+        if self.__tick is None and other.__tick is None:
+            return True
+
+        if self.__tick is not None and other.__tick is not None:
+            return self.__tick == other.__tick
+
+        return False
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, StartFingerprint):
+            return NotImplemented
+        return self.__timestamp == other.__timestamp and self.__tick == other.__tick
+
+    def __hash__(self) -> int:
+        return hash((self.__timestamp, self.__tick))
+
+    def __repr__(self) -> str:
+        return f"StartFingerprint(timestamp={self.__timestamp!r}, tick={self.__tick!r})"
+
+
+class IdentityResolution:
+    """
+    The result of proving a ProcessIdentity against a freshly read process
+    record.
+
+    States:
+      MATCHED:   The very same process instance is still at the PID.
+      GONE:      No process exists at the PID anymore (stale target).
+      REPLACED:  A different process instance now holds the PID (stale
+                 target). It must never be inspected or signalled on behalf
+                 of the old selection.
+    """
+
+    MATCHED: ClassVar[str] = "matched"
+    GONE: ClassVar[str] = "gone"
+    REPLACED: ClassVar[str] = "replaced"
+
+    def __init__(
+        self,
+        identity: "ProcessIdentity",
+        state: str,
+        process: Optional[PxProcess] = None,
+    ) -> None:
+        self.identity = identity
+        self.state = state
+        self.process = process
+
+    @property
+    def is_match(self) -> bool:
+        return self.state == self.MATCHED
+
+    @property
+    def is_stale(self) -> bool:
+        return self.state != self.MATCHED
+
+    @property
+    def stale_reason(self) -> Optional[str]:
+        if self.state == self.MATCHED:
+            return None
+        return self.state
+
+
+class ProcessIdentity:
+    """
+    An immutable (PID, start fingerprint) pair identifying one specific
+    process instance rather than just a PID number.
+
+    Every action on this identity must call resolve() first and only proceed
+    when the result state is MATCHED. GONE / REPLACED results must be reported
+    as stale targets instead of refreshing the PID onto whatever process took
+    it over.
+    """
+
+    def __init__(self, pid: int, fingerprint: StartFingerprint) -> None:
+        self.__pid = pid
+        self.__fingerprint = fingerprint
+
+    @property
+    def pid(self) -> int:
+        return self.__pid
+
+    @property
+    def fingerprint(self) -> StartFingerprint:
+        return self.__fingerprint
+
+    @classmethod
+    def capture(cls, process: PxProcess) -> "ProcessIdentity":
+        return cls(
+            process.pid,
+            StartFingerprint.capture(process.pid, process.start_time),
+        )
+
+    def matches_process(self, process: PxProcess) -> bool:
+        """True iff this identity refers to the given process instance."""
+        if process.pid != self.__pid:
+            return False
+
+        candidate = StartFingerprint.capture(process.pid, process.start_time)
+        return self.__fingerprint.matches(candidate)
+
+    def resolve(
+        self, processes: Optional[List[PxProcess]] = None
+    ) -> IdentityResolution:
+        """
+        Re-read the minimum process record and prove it still matches this
+        identity.
+
+        Without arguments just this one PID is queried from ps. Pass an
+        existing snapshot to verify the record in that instead. The result is
+        always explicit: MATCHED, GONE or REPLACED, never a silently refreshed
+        target.
+        """
+        if processes is None:
+            record = get_process(self.__pid)
+        else:
+            record = next(
+                (candidate for candidate in processes if candidate.pid == self.__pid),
+                None,
+            )
+
+        if record is None:
+            return IdentityResolution(self, IdentityResolution.GONE)
+
+        candidate_fingerprint = StartFingerprint.capture(self.__pid, record.start_time)
+        if not self.__fingerprint.matches(candidate_fingerprint):
+            return IdentityResolution(self, IdentityResolution.REPLACED, record)
+
+        return IdentityResolution(self, IdentityResolution.MATCHED, record)
+
+
 def parse_time(timestring: str) -> float:
     """Convert a CPU time string returned by ps to a number of seconds"""
 
@@ -396,6 +715,45 @@ def remove_process_and_descendants(processes: Dict[int, PxProcess], pid: int) ->
             toexclude.append(child)
 
 
+def get_process(pid: int) -> Optional[PxProcess]:
+    """
+    Re-read the minimum possible process record for one PID.
+
+    Used to prove that a ProcessIdentity still matches before acting on it.
+    Returns None if no process exists at the PID right now. Note that a
+    non-None result does *not* prove the record is the same process instance;
+    callers must compare ProcessIdentity fingerprints for that.
+    """
+    command = [
+        "/bin/ps",
+        "-p",
+        str(pid),
+        "-o",
+        PS_OUTPUT_FIELDS,
+    ]
+
+    with open(os.devnull, "w", encoding="utf-8") as DEVNULL:
+        try:
+            ps_output = subprocess.check_output(
+                command,
+                stdin=DEVNULL,
+                stderr=DEVNULL,
+                close_fds=False,
+                env=px_exec_util.ENV,
+            )
+        except subprocess.CalledProcessError:
+            # ps exits non-zero when no process exists at the PID
+            return None
+
+    ps_lines = ps_output.decode("utf-8").splitlines()
+    if not ps_lines:
+        return None
+
+    now = datetime.datetime.now().replace(tzinfo=TIMEZONE)
+    # With "-p <pid>" there should be at most one result line
+    return ps_line_to_process(ps_lines[0], now)
+
+
 def get_all() -> List[PxProcess]:
     processes = {}
 
@@ -415,7 +773,7 @@ def get_all() -> List[PxProcess]:
         "/bin/ps",
         "-ax",
         "-o",
-        "pid=,ppid=,rss=,lstart=,uid=,pcpu=,time=,%mem=,command=",
+        PS_OUTPUT_FIELDS,
     ]
 
     with open(os.devnull, "w", encoding="utf-8") as DEVNULL:

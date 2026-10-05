@@ -8,7 +8,6 @@ from . import px_poller
 from . import px_process
 from . import px_terminal
 from . import px_sort_order
-from . import px_processinfo
 from . import px_process_menu
 from . import px_category_bar
 
@@ -35,11 +34,14 @@ MODE_SEARCH = 1
 top_mode: int = MODE_BASE
 search_string = ""
 
-# Which pid were we last hovering?
-last_highlighted_pid: Optional[int] = None
+# Which process instance were we last hovering? This is a full identity
+# (PID + immutable start fingerprint) rather than just a PID, so it is proven
+# against every refresh: if the instance exited or its PID got reused, the
+# selection is cleared instead of following the new occupant.
+last_highlighted_identity: Optional[px_process.ProcessIdentity] = None
 
 # Which row were we last hovering? Go for this one if
-# we can't use last_pid.
+# we can't use last_highlighted_identity.
 last_highlighted_row: int = 0
 
 # Has the user manually moved the highlight? If not, just stay on the top
@@ -217,7 +219,7 @@ def writebytes(bytestring: bytes) -> None:
 def get_line_to_highlight(
     toplist: List[px_process.PxProcess], max_process_count: int
 ) -> Optional[int]:
-    global last_highlighted_pid
+    global last_highlighted_identity
     global last_highlighted_row
     global highlight_has_moved
 
@@ -229,19 +231,29 @@ def get_line_to_highlight(
         # No space for the highlight
         return None
 
-    # Before the user has moved the highlight, we don't follow a particular PID
-    if last_highlighted_pid is not None and highlight_has_moved:
-        # Find PID line in list
-        pid_line = None
+    # Before the user has moved the highlight, we don't follow a particular
+    # process instance
+    if last_highlighted_identity is not None and highlight_has_moved:
+        # Find the selected instance's line in this refresh. Matching on the
+        # full identity (not just the PID) ensures we neither follow a reused
+        # PID nor keep acting on a dead instance.
+        identity_line = None
         for index, process in enumerate(toplist):
-            if process.pid == last_highlighted_pid:
-                pid_line = index
+            if last_highlighted_identity.matches_process(process):
+                identity_line = index
                 break
-        if pid_line is not None and pid_line < max_process_count:
-            last_highlighted_row = pid_line
-            return pid_line
 
-    # No PID or not found, go for the last highlighted line instead...
+        if identity_line is not None and identity_line < max_process_count:
+            last_highlighted_row = identity_line
+            return identity_line
+
+        # The selected instance disappeared or its PID was reused, the
+        # selection is cleared and the highlight falls back to tracking its
+        # row position instead.
+        last_highlighted_identity = None
+
+    # No identity, stale identity or an off-screen one, go for the last
+    # highlighted line instead...
 
     # Bound highlight to toplist length and screen height
     last_highlighted_row = min(
@@ -254,7 +266,9 @@ def get_line_to_highlight(
         highlight_has_moved = True
 
     # Stay on the top line unless the user has explicitly moved the highlight
-    last_highlighted_pid = toplist[last_highlighted_row].pid
+    last_highlighted_identity = px_process.ProcessIdentity.capture(
+        toplist[last_highlighted_row]
+    )
 
     return last_highlighted_row
 
@@ -474,7 +488,7 @@ def redraw(
 def handle_search_keypresses(key_sequence: px_terminal.ConsumableString) -> None:
     global search_string
     global last_highlighted_row
-    global last_highlighted_pid
+    global last_highlighted_identity
 
     # If this triggers our top_mode state machine is broken
     assert search_string is not None
@@ -490,10 +504,10 @@ def handle_search_keypresses(key_sequence: px_terminal.ConsumableString) -> None
             search_string = search_string[:-1]
         elif key_sequence.consume(px_terminal.KEY_UPARROW):
             last_highlighted_row -= 1
-            last_highlighted_pid = None
+            last_highlighted_identity = None
         elif key_sequence.consume(px_terminal.KEY_DOWNARROW):
             last_highlighted_row += 1
-            last_highlighted_pid = None
+            last_highlighted_identity = None
         elif (
             key_sequence.consume(px_terminal.KEY_ENTER)
             or key_sequence._string == px_terminal.KEY_ESC
@@ -541,25 +555,29 @@ def get_command(**kwargs):
         return CMD_HANDLED
 
     global last_highlighted_row
-    global last_highlighted_pid
+    global last_highlighted_identity
     global sort_order
     while len(user_input) > 0:
         if user_input.consume(px_terminal.KEY_UPARROW):
             last_highlighted_row -= 1
-            last_highlighted_pid = None
+            last_highlighted_identity = None
         elif user_input.consume(px_terminal.KEY_DOWNARROW):
             last_highlighted_row += 1
-            last_highlighted_pid = None
+            last_highlighted_identity = None
         elif user_input.consume(px_terminal.KEY_ENTER):
-            if last_highlighted_pid is None:
+            if last_highlighted_identity is None:
                 continue
-            processes = px_process.get_all()
-            process = px_processinfo.find_process_by_pid(
-                last_highlighted_pid, processes
-            )
-            if not process:
+
+            # Re-read the minimum record and prove identity before handing
+            # anything to the menu. If the instance exited or its PID was
+            # reused we just drop the selection and never open a menu for
+            # whoever now holds the PID.
+            resolution = last_highlighted_identity.resolve()
+            if resolution.is_stale:
+                last_highlighted_identity = None
                 continue
-            px_process_menu.PxProcessMenu(process).start()
+            assert resolution.process is not None
+            px_process_menu.PxProcessMenu(resolution.process).start()
         elif user_input.consume("/"):
             top_mode = MODE_SEARCH
             return None
